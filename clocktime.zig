@@ -15,9 +15,9 @@ pub const Timestamp = extern struct {
     tm_wday: c_int,
     tm_yday: c_int,
     tm_isdst: c_int,
+};
 
-    
-    pub fn localtime() !Timestamp {
+pub fn Localtimestamp() !Timestamp {
         const ts = std.time.timestamp();
         var c_ts: c.time_t = @intCast(ts);
 
@@ -41,4 +41,4 @@ pub const Timestamp = extern struct {
             .tm_isdst = tmval.tm_isdst,
         };
     }
-};
+

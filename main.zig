@@ -11,8 +11,8 @@ const msg = struct {
     userName: []const u8,
     sendTime: clocktime.Timestamp = undefined,
     
-    pub fn send(this: *self, allocator: std.mem.Allocator) ![]u8 {
-        const ourSendTime: clocktime.Timestamp = clocktime.Timestamp.localtime() catch |err| return err;
+    pub fn new(this: *self, allocator: std.mem.Allocator) ![]u8 {
+        const ourSendTime: clocktime.Timestamp = clocktime.Localtimestamp() catch |err| return err;
         this.sendTime = ourSendTime;
 
         return try std.fmt.allocPrint(allocator, "[{d}:{d}:{d}] {s}: {s}\n", .{ourSendTime.tm_hour, ourSendTime.tm_min, ourSendTime.tm_sec, this.userName, this.data});
@@ -35,5 +35,5 @@ pub fn main() !void {
     var myMsg = msg{.userName = "exx", .data = "foobar"};
     _ = &myMsg;
 
-    stdout.print("{s}\n", .{try myMsg.send(gpallocator)}) catch |err| return err;
+    stdout.print("{s}\n", .{try myMsg.new(gpallocator)}) catch |err| return err;
 }
