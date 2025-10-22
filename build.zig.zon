@@ -1,0 +1,14 @@
+.{
+    .name = .cli_chat,
+    .version = "0.1.0",
+
+    .fingerprint = 0xa631759ee1537615,
+    .paths = .{ "" },
+
+    .dependencies = .{
+        .network = .{
+            .url = "https://github.com/ikskuh/zig-network/archive/master.tar.gz",
+            .hash = "network-0.1.0-Pm-Agl8xAQBmkwohveGOfTk4zQnuqDs0Ptfbms4KP5Ce",
+        },
+    },
+}
