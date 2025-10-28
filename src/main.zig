@@ -34,7 +34,6 @@ fn readLine() ![]const u8 {
 
 fn createListener(
 port_number: u16, 
-allocator: std.mem.Allocator, 
 writer: std.fs.File.Writer
 ) !MessageSocket {
     const address = try std.net.Address.parseIp("127.0.0.1", port_number);
@@ -56,7 +55,7 @@ writer: std.fs.File.Writer
 
 pub const MessageSocket = struct {
     listener: std.posix.socket_t,
-    writer: std.fs.File.writer,
+    writer: std.fs.File.Writer,
     port_num: u16,
     
     pub fn read(self: @This()) !posix.socket_t {
@@ -109,4 +108,32 @@ pub fn main() !void {
 
     const line = try reader.readUntilDelimiterOrEof(&buf, '\n');
     const username = if (line) |usrnme| usrnme else "Anonymous"; 
+
+    const tcpconn: MessageSocket = createListener(port, stdout_writer) catch |err| {
+        std.debug.print("{s}\n", .{@errorName(err)});
+        return err;
+    }; 
+
+    const socket = try tcpconn.read();
+
+    while (true) {
+        var listenThread = try std.Thread.spawn(.{}, tcpconn.read, .{&tcpconn});
+        listenThread.join();
+    }
+
+    while (true) {
+        const inputLine: [128]u8 = undefined;
+
+        const n = try std.io.Reader.readUntilDelimiterOrEof(&line, '\n');
+        _  = &n;
+
+
+        if (line.len > 0) {
+            stdout_writer.print("{s}\n", .{inputLine});
+            
+            const createdMsg = msg{.data = inputLine, .userName = username};
+            try tcpconn.write(socket, createdMsg.new(gpallocator));
+        }
+    }
+
 }
