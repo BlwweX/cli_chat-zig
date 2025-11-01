@@ -10,32 +10,26 @@ const stdin = std.io.getStdIn();
 const reader = stdin.reader();
 const stdout_writer = std.io.getStdOut().writer();
 
-const msg = struct {
-    const self = @This();
-    data: []const u8,
-    userName: []const u8,
-    sendTime: clocktime.Timestamp = undefined,
-    
-    pub fn new(this: *self, allocator: std.mem.Allocator) ![]u8 {
-        const ourSendTime: clocktime.Timestamp = clocktime.Localtimestamp() catch |err| return err;
-        this.sendTime = ourSendTime;
-        return try std.fmt.allocPrint(allocator, "[{d}:{d}:{d}] {s}: {s}\n",
-            .{ ourSendTime.tm_hour, ourSendTime.tm_min, ourSendTime.tm_sec, this.userName, this.data });
-    }
-};
+fn formatChat(allocator: std.mem.Allocator, buf: []const u8, username: []const u8) ![]u8 {
+    const ourSendTime: clocktime.Timestamp = clocktime.Localtimestamp() catch |err| return err;
 
-fn readLine() ![]const u8 {
-    const stdin_reader = std.io.getStdIn().reader();
-    var result: [256]u8 = undefined;
-    const slice = try stdin_reader.readUntilDelimiter(&result, '\n');
-    const clean = std.mem.trimRight(u8, slice, "\r\n");
-    return clean;
+    return try std.fmt.allocPrint(allocator, "[{d}:{d}:{d}] {s}: {s}\n",
+        .{ ourSendTime.tm_hour, ourSendTime.tm_min, ourSendTime.tm_sec, username, buf });
 }
 
-fn createListener(
-port_number: u16, 
-writer: std.fs.File.Writer
-) !MessageSocket {
+fn readLine() ![]u8 {
+    var buf: [256]u8 = undefined;
+    const stdin_reader = std.io.getStdIn().reader();
+    const line_opt = try stdin_reader.readUntilDelimiterOrEof(&buf, '\n');
+    if (line_opt) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r\n");
+        return try std.heap.page_allocator.dupe(u8, trimmed);
+    } else {
+        return error.EndOfStream;
+    }
+}
+
+fn createListener(port_number: u16, writer: std.fs.File.Writer) !MessageSocket {
     const address = try std.net.Address.parseIp("127.0.0.1", port_number);
 
     const tpe: u32 = posix.SOCK.STREAM;
@@ -43,43 +37,60 @@ writer: std.fs.File.Writer
     const listener = try posix.socket(address.any.family, tpe, protocol);
     
     try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-
     try posix.bind(listener, &address.any, address.getOsSockLen());
+    try posix.listen(listener, 128);
 
     return MessageSocket{
         .listener = listener,
         .writer = writer,
-        .port_num = port_number
+        .port_num = port_number,
     };
 }
 
-pub const MessageSocket = struct {
+const MessageSocket = struct {
     listener: std.posix.socket_t,
     writer: std.fs.File.Writer,
     port_num: u16,
     
-    pub fn read(self: @This()) !posix.socket_t {
-        var client_addr: net.Address = undefined;
-        var client_addr_len: posix.socklen_t = @sizeOf(net.Address);
+    
+    
+    pub fn readFromPort(self: @This()) !void {
+        while (true) {
+            var client_addr: net.Address = undefined;
+            var client_addr_len: posix.socklen_t = @sizeOf(net.Address);
+            const socket = try posix.accept(self.listener, &client_addr.any, &client_addr_len, 0);
 
-        const socket = try posix.accept(self.listener,  &client_addr.any, &client_addr_len, 0);
+            var buf: [64]u8 = undefined;
+            const n = posix.read(socket, &buf) catch {
+                _ = posix.close(socket);
+                continue;
+            };
 
-       var buf: [128]u8 = undefined;
+            const username = std.mem.trimRight(u8, buf[0..n], "\r\n");
+            const name_copy = gpallocator.dupe(u8, username) catch {
+                _ = posix.close(socket);
+                continue;
+            };
 
-        const readBytes = try posix.read(socket, &buf);
-        
+            client_lock.lock();
+            _ = clients.append(.{ .socket = socket, .username = name_copy }) catch {};
+            client_lock.unlock();
 
-        if (readBytes != 0) {
-            try self.writer.print("{s}\n", .{buf[0..readBytes]});
+            const join_msg = std.fmt.allocPrint(gpallocator, "{s} joined the chat\n", .{username}) catch "";
+            broadcast(socket, join_msg);
+            gpallocator.free(join_msg);
+
+            _ = std.Thread.spawn(.{}, handleClient, .{socket}) catch {};
         }
-
-        return socket;
     }
 
-    pub fn write(socket: posix.socket_t, writeMsg: []const u8) !void {
+
+
+    pub fn writeToPort(self: @This(), socket: posix.socket_t, writeMsg: []const u8) !void {
+        _ = &self;
         var pos: usize = 0;
 
-        while (pos < msg.len) {
+        while (pos < writeMsg.len) {
             const written = try posix.write(socket, writeMsg[pos..]);
             if (written == 0) {
                 return error.Closed;
@@ -87,8 +98,82 @@ pub const MessageSocket = struct {
             pos += written;
         }
     }
-       
 };
+
+const Client = struct {
+    socket: posix.socket_t,
+    username: []const u8,
+};
+
+var clients = std.ArrayList(Client).init(gpallocator);
+var client_lock: std.Thread.Mutex = .{};
+
+fn listenLoop(conn: *const MessageSocket) void {
+    while (true) {
+        _ = conn.readFromPort() catch {};
+    }
+}
+
+
+fn handleClient(socket: posix.socket_t) void {
+    var buf: [512]u8 = undefined;
+    while (true) {
+        const n = posix.read(socket, &buf) catch break;
+        if (n == 0) break;
+        
+        const sender_name = getUsername(socket);
+        const formatted = std.fmt.allocPrint(gpallocator, "{s}: {s}", .{sender_name, buf[0..n]}) catch "";
+        broadcast(socket, formatted);
+        gpallocator.free(formatted);
+    }
+
+    client_lock.lock();
+    defer client_lock.unlock();
+
+    var i: usize = 0;
+    while (i < clients.items.len) : (i += 1) {
+        if (clients.items[i].socket == socket) {
+            const name_to_free = clients.items[i].username;
+
+            _ = clients.swapRemove(i);
+            gpallocator.free(name_to_free);
+            break;
+        }
+    }
+
+    _ = posix.close(socket);
+}
+
+fn getUsername(socket: posix.socket_t) []const u8 {
+    client_lock.lock();
+    defer client_lock.unlock();
+
+    for (clients.items) |client| {
+        if (client.socket == socket) return client.username;
+    }
+    return "Unknown";
+}
+
+
+fn broadcast(sender: posix.socket_t, msg: []const u8) void {
+    client_lock.lock();
+    defer client_lock.unlock();
+
+    for (clients.items) |client| {
+        if (client.socket != sender) {
+            _ = posix.write(client.socket, msg) catch {};
+        }
+    }
+}
+
+fn readAndSendChat(username: []const u8, tcpconn: MessageSocket, socket: posix.socket_t) !void {
+    const currentChat = try readLine();
+    const formatted = try formatChat(gpallocator, currentChat, username);
+    try stdout_writer.print("{s}\n", .{formatted});
+
+    defer gpallocator.free(formatted);
+    try tcpconn.writeToPort(socket, formatted);
+}
 
 pub fn main() !void {
     const args = std.process.argsAlloc(gpallocator) catch |err| {
@@ -102,38 +187,10 @@ pub fn main() !void {
         return;
     }
 
-    const port = try std.fmt.parseInt(u16, args[1], 10);
-    try stdout_writer.print("Enter username: \n", .{});
-    var buf: [100]u8 = undefined;
+    const port = try std.fmt.parseInt(u16, args[1], 10);    
+    const tcpconn: MessageSocket = try createListener(port, stdout_writer);
 
-    const line = try reader.readUntilDelimiterOrEof(&buf, '\n');
-    const username = if (line) |usrnme| usrnme else "Anonymous"; 
+    try stdout_writer.print("Server listening on port {d}\n", .{port});
 
-    const tcpconn: MessageSocket = createListener(port, stdout_writer) catch |err| {
-        std.debug.print("{s}\n", .{@errorName(err)});
-        return err;
-    }; 
-
-    const socket = try tcpconn.read();
-
-    while (true) {
-        var listenThread = try std.Thread.spawn(.{}, tcpconn.read, .{&tcpconn});
-        listenThread.join();
-    }
-
-    while (true) {
-        const inputLine: [128]u8 = undefined;
-
-        const n = try std.io.Reader.readUntilDelimiterOrEof(&line, '\n');
-        _  = &n;
-
-
-        if (line.len > 0) {
-            stdout_writer.print("{s}\n", .{inputLine});
-            
-            const createdMsg = msg{.data = inputLine, .userName = username};
-            try tcpconn.write(socket, createdMsg.new(gpallocator));
-        }
-    }
-
+    try tcpconn.readFromPort();
 }
